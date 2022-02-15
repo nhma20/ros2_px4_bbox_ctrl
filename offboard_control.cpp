@@ -48,6 +48,7 @@
 #include <px4_msgs/msg/timesync.hpp>
 #include <px4_msgs/msg/vehicle_command.hpp>
 #include <px4_msgs/msg/vehicle_control_mode.hpp>
+#include <px4_msgs/msg/vehicle_status.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <stdint.h>
 
@@ -77,6 +78,20 @@ public:
 			this->create_publisher<VehicleCommand>("fmu/vehicle_command/in");
 #endif
 
+
+		// VehicleStatus: https://github.com/PX4/px4_msgs/blob/master/msg/VehicleStatus.msg
+		// receives nothing
+		vehicle_status_sub_ = create_subscription<px4_msgs::msg::VehicleStatus>(
+            "vehicle_status",
+            10,
+            [this](px4_msgs::msg::VehicleStatus::ConstSharedPtr msg) {
+              arming_state_ = msg->arming_state;
+              nav_state_ = msg->nav_state;
+			  RCLCPP_INFO(this->get_logger(), "arming_state_: %d", arming_state_);
+			  RCLCPP_INFO(this->get_logger(), "nav_state_: %d", nav_state_);
+			});
+
+
 		// get common timestamp
 		timesync_sub_ =
 			this->create_subscription<px4_msgs::msg::Timesync>("fmu/timesync/out", 10,
@@ -84,29 +99,53 @@ public:
 					timestamp_.store(msg->timestamp);
 				});
 
-		offboard_setpoint_counter_ = 0;
+
+		// Get velocity vector values
+		// TrajectorySetpoint: https://github.com/PX4/px4_msgs/blob/ros2/msg/TrajectorySetpoint.msg
+		vel_ctrl_subscription_ = this->create_subscription<px4_msgs::msg::TrajectorySetpoint>(
+			"vel_ctrl_vect_topic",	10,
+			[this](const px4_msgs::msg::TrajectorySetpoint::UniquePtr msg) {
+					x_ = msg->x;
+					y_ = msg->y;
+					z_ = msg->z;
+					yaw_ = msg->yaw;
+					yawspeed_ = msg->yawspeed;
+					vx_ = msg->vx;
+					vy_ = msg->vy;
+					vz_ = msg->vz;
+				});
+
 
 		auto timer_callback = [this]() -> void {
 
 			if (offboard_setpoint_counter_ == 10) {
 				// Change to Offboard mode after 10 setpoints
+				RCLCPP_INFO(this->get_logger(), "Entering offboard control mode");
 				this->publish_vehicle_command(VehicleCommand::VEHICLE_CMD_DO_SET_MODE, 1, 6);
-
-				// Arm the vehicle
 				this->arm();
 			}
 
 			// offboard_control_mode needs to be paired with trajectory_setpoint
-			if (offboard_setpoint_counter_ < 200) {
+			if (offboard_setpoint_counter_ < hover_count_) {
 				publish_offboard_control_mode();
-				publish_trajectory_setpoint();
-				offboard_setpoint_counter_++;
+				publish_hover_setpoint();
 			// stop the counter and land after after reaching certain value
-			} else {
+			} 
+			else if  (offboard_setpoint_counter_ < tracking_count_) {
+				publish_offboard_control_mode();
+				publish_tracking_setpoint();
+			} 
+			else if (offboard_setpoint_counter_ == landing_count_) {
 				this->publish_vehicle_command(VehicleCommand::VEHICLE_CMD_NAV_LAND);
+				RCLCPP_INFO(this->get_logger(), "Landing at current position");
 			}
+
+			offboard_setpoint_counter_++;
 		};
+
+
 		timer_ = this->create_wall_timer(100ms, timer_callback);
+		
 	}
 
 	void arm() const;
@@ -118,14 +157,30 @@ private:
 	rclcpp::Publisher<OffboardControlMode>::SharedPtr offboard_control_mode_publisher_;
 	rclcpp::Publisher<TrajectorySetpoint>::SharedPtr trajectory_setpoint_publisher_;
 	rclcpp::Publisher<VehicleCommand>::SharedPtr vehicle_command_publisher_;
+	
 	rclcpp::Subscription<px4_msgs::msg::Timesync>::SharedPtr timesync_sub_;
+	rclcpp::Subscription<px4_msgs::msg::VehicleStatus>::SharedPtr vehicle_status_sub_;
+	rclcpp::Subscription<px4_msgs::msg::TrajectorySetpoint>::SharedPtr vel_ctrl_subscription_;
 
 	std::atomic<uint64_t> timestamp_;   //!< common synced timestamped
+	int nav_state_;
+	int arming_state_;
 
-	uint64_t offboard_setpoint_counter_;   //!< counter for the number of setpoints sent
+	bool armed_ = false;
+	bool land_requested_ = false;
+
+	float x_ = NAN, y_ = NAN, z_ = NAN;
+	float yaw_ = NAN, yawspeed_ = NAN;
+	float vx_ = NAN, vy_ = NAN, vz_ = NAN;
+
+	uint64_t offboard_setpoint_counter_ = 0;   //!< counter for the number of setpoints sent
+	uint64_t hover_count_ = 100;
+	uint64_t tracking_count_ = 100;
+	uint64_t landing_count_ = tracking_count_;
 
 	void publish_offboard_control_mode() const;
-	void publish_trajectory_setpoint() const;
+	void publish_hover_setpoint() const;
+	void publish_tracking_setpoint() const;
 	void publish_vehicle_command(uint16_t command, float param1 = 0.0,
 				     float param2 = 0.0) const;
 };
@@ -170,33 +225,34 @@ void OffboardControl::publish_offboard_control_mode() const {
  *        For this example, it sends a trajectory setpoint to make the
  *        vehicle hover at 5 meters with a yaw angle of 180 degrees.
  */
-void OffboardControl::publish_trajectory_setpoint() const {
+void OffboardControl::publish_hover_setpoint() const {
 
-	static int hover_time = 0;
 	TrajectorySetpoint msg{};
-
-	if (hover_time < 100)
-	{
-		msg.timestamp = timestamp_.load();
-		msg.x = 0.0;
-		msg.y = 0.0;
-		msg.z = -5.0;
-		msg.yaw = -3.14; // [-PI:PI]
-		trajectory_setpoint_publisher_->publish(msg);
-
-	} else {
-		msg.timestamp = timestamp_.load();
-		msg.x = 0.0;
-		msg.y = 0.0;
-		msg.z = 1.0;
-		msg.yaw = -1.5; // [-PI:PI]
-	}
-
-hover_time++;
-RCLCPP_INFO(this->get_logger(), "hover_time: %d", hover_time);
-//trajectory_setpoint_publisher_->publish(msg);
+	msg.timestamp = timestamp_.load();
+	msg.x = 0.0;
+	msg.y = 0.0;
+	msg.z = -2.0;
+	msg.yaw = -3.14; // [-PI:PI]
+	trajectory_setpoint_publisher_->publish(msg);
 
 }
+
+
+/**
+ * @brief Publish a trajectory setpoint
+ *        For this example, it sends a trajectory setpoint to make the
+ *        vehicle hover at 5 meters with a yaw angle of 180 degrees.
+ */
+void OffboardControl::publish_tracking_setpoint() const {
+
+	TrajectorySetpoint msg{};
+	msg.timestamp = timestamp_.load();
+	msg.vx = vx_;	// forwards/backwards in m/s NED
+	msg.yawspeed = yawspeed_;	// rotational speed around z in radians/sec NED
+	trajectory_setpoint_publisher_->publish(msg);
+
+}
+
 
 /**
  * @brief Publish vehicle commands
