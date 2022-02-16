@@ -52,8 +52,13 @@
 #include <rclcpp/rclcpp.hpp>
 #include <stdint.h>
 
+#include <math.h>  
+#include <limits>
+
 #include <chrono>
 #include <iostream>
+
+#define NAN_ std::numeric_limits<double>::quiet_NaN()
 
 using namespace std::chrono;
 using namespace std::chrono_literals;
@@ -80,16 +85,15 @@ public:
 
 
 		// VehicleStatus: https://github.com/PX4/px4_msgs/blob/master/msg/VehicleStatus.msg
-		// receives nothing
-		vehicle_status_sub_ = create_subscription<px4_msgs::msg::VehicleStatus>(
-            "vehicle_status",
+		/*vehicle_status_sub_ = create_subscription<px4_msgs::msg::VehicleStatus>(
+            "/fmu/vehicle_status/out",
             10,
             [this](px4_msgs::msg::VehicleStatus::ConstSharedPtr msg) {
               arming_state_ = msg->arming_state;
               nav_state_ = msg->nav_state;
 			  RCLCPP_INFO(this->get_logger(), "arming_state_: %d", arming_state_);
 			  RCLCPP_INFO(this->get_logger(), "nav_state_: %d", nav_state_);
-			});
+			});*/
 
 
 		// get common timestamp
@@ -123,6 +127,7 @@ public:
 				RCLCPP_INFO(this->get_logger(), "Entering offboard control mode");
 				this->publish_vehicle_command(VehicleCommand::VEHICLE_CMD_DO_SET_MODE, 1, 6);
 				this->arm();
+				RCLCPP_INFO(this->get_logger(), "Takeoff and hover");
 			}
 
 			// offboard_control_mode needs to be paired with trajectory_setpoint
@@ -131,9 +136,15 @@ public:
 				publish_hover_setpoint();
 			// stop the counter and land after after reaching certain value
 			} 
-			else if  (offboard_setpoint_counter_ < tracking_count_) {
+			else if  (offboard_setpoint_counter_ < tracking_count_) {	
+				if (offboard_setpoint_counter_ == hover_count_)
+				{	
+					RCLCPP_INFO(this->get_logger(), "Follow tracking setpoints");
+				}
+						
 				publish_offboard_control_mode();
 				publish_tracking_setpoint();
+				//RCLCPP_INFO(this->get_logger(), "vx: %f yawspeed: %f", vx_, yawspeed_);
 			} 
 			else if (offboard_setpoint_counter_ == landing_count_) {
 				this->publish_vehicle_command(VehicleCommand::VEHICLE_CMD_NAV_LAND);
@@ -144,7 +155,7 @@ public:
 		};
 
 
-		timer_ = this->create_wall_timer(100ms, timer_callback);
+		timer_ = this->create_wall_timer(50ms, timer_callback);
 		
 	}
 
@@ -169,13 +180,14 @@ private:
 	bool armed_ = false;
 	bool land_requested_ = false;
 
-	float x_ = NAN, y_ = NAN, z_ = NAN;
-	float yaw_ = NAN, yawspeed_ = NAN;
-	float vx_ = NAN, vy_ = NAN, vz_ = NAN;
+	float x_ = 0, y_ = 0, z_ = 0;
+	float yaw_ = 0, yawspeed_ = 0;
+	float vx_ = 0, vy_ = 0, vz_ = 0;
+	float hover_height_ = 2;
 
 	uint64_t offboard_setpoint_counter_ = 0;   //!< counter for the number of setpoints sent
-	uint64_t hover_count_ = 100;
-	uint64_t tracking_count_ = 100;
+	uint64_t hover_count_ = 200;
+	uint64_t tracking_count_ = 500;
 	uint64_t landing_count_ = tracking_count_;
 
 	void publish_offboard_control_mode() const;
@@ -211,11 +223,10 @@ void OffboardControl::publish_offboard_control_mode() const {
 	OffboardControlMode msg{};
 	msg.timestamp = timestamp_.load();
 	msg.position = true;
-	msg.velocity = false;
+	msg.velocity = true;
 	msg.acceleration = false;
 	msg.attitude = false;
-	msg.body_rate = false;
-
+	msg.body_rate = false;	
 	offboard_control_mode_publisher_->publish(msg);
 }
 
@@ -229,28 +240,31 @@ void OffboardControl::publish_hover_setpoint() const {
 
 	TrajectorySetpoint msg{};
 	msg.timestamp = timestamp_.load();
-	msg.x = 0.0;
-	msg.y = 0.0;
-	msg.z = -2.0;
-	msg.yaw = -3.14; // [-PI:PI]
+	msg.x = NAN; 		// in meters NED
+	msg.y = NAN;
+	msg.z = -hover_height_;
+	msg.yaw = NAN;
 	trajectory_setpoint_publisher_->publish(msg);
-
 }
 
 
 /**
  * @brief Publish a trajectory setpoint
- *        For this example, it sends a trajectory setpoint to make the
- *        vehicle hover at 5 meters with a yaw angle of 180 degrees.
+ *        Track bounding box only with velocities and yawspeed.
  */
 void OffboardControl::publish_tracking_setpoint() const {
 
 	TrajectorySetpoint msg{};
 	msg.timestamp = timestamp_.load();
+	msg.x = NAN; 		// in meters NED
+	msg.y = NAN;
+	msg.z = -hover_height_;
+	msg.yaw = NAN;
+	msg.yawspeed = yawspeed_;	// rotational speed around z in radians/sec
 	msg.vx = vx_;	// forwards/backwards in m/s NED
-	msg.yawspeed = yawspeed_;	// rotational speed around z in radians/sec NED
+	msg.vy = vy_;
+	msg.vz = 0.0;
 	trajectory_setpoint_publisher_->publish(msg);
-
 }
 
 

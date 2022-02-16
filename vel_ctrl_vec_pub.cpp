@@ -1,7 +1,7 @@
 #include <rclcpp/rclcpp.hpp>
-#include <px4_msgs/msg/debug_vect.hpp>
-#include <sensor_msgs/msg/point_cloud2.hpp>
-#include <sensor_msgs/msg/point_field.hpp>
+#include <px4_msgs/msg/trajectory_setpoint.hpp>
+#include "vision_msgs/msg/bounding_box2_d.hpp"
+#include <px4_msgs/msg/vehicle_odometry.hpp>
 
 #include <algorithm>
 #include <cstdlib>
@@ -14,6 +14,7 @@
 #include <vector>
 #include <string>
 
+#define PI 3.14159265
 
 using namespace std::chrono_literals;
 
@@ -25,12 +26,16 @@ class VelocityControlVectorAdvertiser : public rclcpp::Node
 //Messages are sent based on a timed callback.
 	public:
 		VelocityControlVectorAdvertiser() : Node("vel_ctrl_vect_advertiser") {
-			publisher_ = this->create_publisher<px4_msgs::msg::DebugVect>("vel_ctrl_vect_topic", 10);
+			publisher_ = this->create_publisher<px4_msgs::msg::TrajectorySetpoint>("vel_ctrl_vect_topic", 10);
 						
-			lidar_to_mmwave_pcl_subscription_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-			"/lidar_to_mmwave_pcl",	10,
-			std::bind(&VelocityControlVectorAdvertiser::OnDepthMsg, this, std::placeholders::_1));
-			
+			bbox_subscription_ = this->create_subscription<vision_msgs::msg::BoundingBox2D>(
+			"/bbox",	10,
+			std::bind(&VelocityControlVectorAdvertiser::OnBboxMsg, this, std::placeholders::_1));
+		
+			odometry_subscription_ = this->create_subscription<px4_msgs::msg::VehicleOdometry>(  ////
+			"/fmu/vehicle_odometry/out",	10,
+			std::bind(&VelocityControlVectorAdvertiser::OnOdoMsg, this, std::placeholders::_1));
+		
 		}
 
 		~VelocityControlVectorAdvertiser() {
@@ -40,155 +45,118 @@ class VelocityControlVectorAdvertiser : public rclcpp::Node
 
 	private:
 		rclcpp::TimerBase::SharedPtr timer_;
-		rclcpp::Publisher<px4_msgs::msg::DebugVect>::SharedPtr publisher_;
-		rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr lidar_to_mmwave_pcl_subscription_;
+		rclcpp::Publisher<px4_msgs::msg::TrajectorySetpoint>::SharedPtr publisher_;
+		rclcpp::Subscription<vision_msgs::msg::BoundingBox2D>::SharedPtr bbox_subscription_;
+		rclcpp::Subscription<px4_msgs::msg::VehicleOdometry>::SharedPtr odometry_subscription_;  ////
+
+		float bbox_size_x_;
+		float bbox_size_y_;
+		float bbox_center_x_;
+		float bbox_center_y_;
+		float bbox_orientation_;
+
+		float desired_bbox_size_x_ = 50;
+		float desired_bbox_center_x_ = 127;
+
+		float yaw_ = 0;
+		float yaw_deg_ = 0;
 
 		int callback_count = 0;
-		void OnDepthMsg(const sensor_msgs::msg::PointCloud2::SharedPtr _msg);
-		void VelocityDroneControl(float xv, float yv, float zv);
+		void VelocityDroneControl(float xv, float yawspeed);
+		void OnBboxMsg(const vision_msgs::msg::BoundingBox2D::SharedPtr _msg);
+		void OnOdoMsg(const px4_msgs::msg::VehicleOdometry::SharedPtr _msg); ////
 		float constrain(float val, float lo_lim, float hi_lim);
-		bool beginHover();
+
 };
 
 
 // publish drone velocity vector
-void VelocityControlVectorAdvertiser::VelocityDroneControl(float xv, float yv, float zv){
-	auto vel_ctrl_vect = px4_msgs::msg::DebugVect();
+void VelocityControlVectorAdvertiser::VelocityDroneControl(float xv, float yawspeed){
+
+	// translate x velocity from local drone frame to global NED frame
+	float x_NED = cos(yaw_deg_*(PI/180.0)) * xv;
+	float y_NED = sin(yaw_deg_*(PI/180.0)) * xv;
+
+	auto vel_ctrl_vect = px4_msgs::msg::TrajectorySetpoint();
 	vel_ctrl_vect.timestamp = std::chrono::time_point_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()).time_since_epoch().count();
-	std::string name = "test";
-	std::copy(name.begin(), name.end(), vel_ctrl_vect.name.begin());
-	vel_ctrl_vect.x = xv;
-	vel_ctrl_vect.y = yv;
-	vel_ctrl_vect.z = zv;
+	vel_ctrl_vect.x = 0;
+	vel_ctrl_vect.y = 0;
+	vel_ctrl_vect.z = 0;
+	vel_ctrl_vect.yaw = 0;
+	vel_ctrl_vect.yawspeed = yawspeed;
+	vel_ctrl_vect.vx = x_NED;
+	vel_ctrl_vect.vy = y_NED;
+	vel_ctrl_vect.vz = 0;
 	this->publisher_->publish(vel_ctrl_vect);
 }
 
 
-// mmwave message callback function
-void VelocityControlVectorAdvertiser::OnDepthMsg(const sensor_msgs::msg::PointCloud2::SharedPtr _msg){
+// bounding box message callback function
+void VelocityControlVectorAdvertiser::OnBboxMsg(const vision_msgs::msg::BoundingBox2D::SharedPtr _msg){
 
-	// read PointCloud2 msg data
-	int pcl_size = _msg->width;
-	uint8_t *ptr = _msg->data.data();
-	const uint32_t  POINT_STEP = 12;
-	std::vector<float> pcl_x;
-	std::vector<float> pcl_y;
-	std::vector<float> pcl_z;
-	for (size_t i = 0; i < pcl_size; i++)
-	{
-		pcl_x.push_back(*(reinterpret_cast<float*>(ptr + 0)));
-		pcl_y.push_back(*(reinterpret_cast<float*>(ptr + 4)));
-		pcl_z.push_back(*(reinterpret_cast<float*>(ptr + 8)));
-		ptr += POINT_STEP;
-	}
+	bbox_size_x_ = _msg->size_x;
+	bbox_size_y_ = _msg->size_y;
+	bbox_center_x_ = _msg->center.x;
+	bbox_center_y_ = _msg->center.y;
+	bbox_orientation_ = _msg->center.theta;
 
-	float closest_dist = std::numeric_limits<float>::max(); 
-	float current_dist = 0;
-	int closest_dist_idx = 0;
-	// find closest point in pointcloud msg
-	for (int i = 0; i < pcl_size; i++)
-	{
-		current_dist = sqrt( pow(pcl_x.at(i), 2) + pow(pcl_y.at(i), 2) + pow(pcl_z.at(i), 2) );
-		if( current_dist < closest_dist ){
-			closest_dist = current_dist;
-			closest_dist_idx = i;
-		}
-	}
+	float distance_error = desired_bbox_size_x_ - bbox_size_x_; // positive means move towards
+	float x_position_error = bbox_center_x_ - desired_bbox_center_x_; // positive means rotate +z
 
-	static float shortest_dist_angle_xz;
-	static float shortest_dist_angle_yz;
-	static float shortest_dist;
-	float prev_shortest_dist_angle_xz;
-	float prev_shortest_dist_angle_yz;
-	float prev_shortest_dist;
+	float kp_dist = 0.01; // proportional gain for distance controller
+	float ki_dist = 0.01; // integral gain for distance controller
+	//float kd_dist = 0.015; // derivative gain for distance controller
 
-	if(pcl_size > 0){
-		prev_shortest_dist_angle_xz = shortest_dist_angle_xz;
-		prev_shortest_dist_angle_yz = shortest_dist_angle_yz;
-		prev_shortest_dist = shortest_dist;
-		shortest_dist_angle_xz = asin(pcl_x.at(closest_dist_idx) / sqrt(pow(pcl_x.at(closest_dist_idx),2) + pow(pcl_z.at(closest_dist_idx),2)));
-		shortest_dist_angle_yz = asin(pcl_y.at(closest_dist_idx) / sqrt(pow(pcl_y.at(closest_dist_idx),2) + pow(pcl_z.at(closest_dist_idx),2)));
-		shortest_dist = closest_dist;
-		RCLCPP_INFO(this->get_logger(),  "\n Dist: %f, \n XZ Angle: %f, \n YX Angle: %f", shortest_dist, shortest_dist_angle_xz, shortest_dist_angle_yz);
+	float kp_x_pos = 0.01; // proportional gain for x position controller
+	float ki_x_pos = 0.01; // integral gain for x position controller 
+	//float kd_x_pos = 0.0005; // derivative gain for x position controller
 
-	} else{	
-		RCLCPP_INFO(this->get_logger(),  "\n No points in pointcloud");
-	}
-
-	auto vel_ctrl_vect = px4_msgs::msg::DebugVect();
-	vel_ctrl_vect.timestamp = std::chrono::time_point_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()).time_since_epoch().count();
-	std::string name = "test";
-	std::copy(name.begin(), name.end(), vel_ctrl_vect.name.begin());
-	
-	bool hovering = true; //beginHover();
-
-	float control_distance = 0.5; // desired distance to cable (meters)
-	float control_angle = 0.0; // desired angle to cable (rad)
-	float kp_dist = 0.5; // proportional gain for distance controller - nonoise 1.5
-	float kp_angle = 5.0; // proportional gain for angle controller - nonoise 5.0
-	float kd_dist = 0.015; // derivative gain for distance controller - nonoise 1.5
-	float kd_angle = 0.0005; // derivative gain for angle controller - nonoise 0.5
-	float ki_dist = 0.01; // integral gain for distance controller - nonoise 0.05
-	float ki_angle = 0.01; // integral gain for angle controller - nonoise 0.05
-
-	/*auto time
-	static auto start = std::chrono::system_clock::now();
-    auto end = std::chrono::system_clock::now();
-	std::chrono::duration<double> elapsed_seconds = end-start;*/
-
-	float dt = 0.02; // seconds
-	float d_dist = ((shortest_dist-control_distance) - (prev_shortest_dist-control_distance)) / dt;
+	float dt = 0.033; // seconds, approximate time between received msgs
+	/*float d_dist = ((shortest_dist-control_distance) - (prev_shortest_dist-control_distance)) / dt;
 	float d_angle_xz = ((shortest_dist_angle_xz-control_angle) - (prev_shortest_dist_angle_xz-control_angle)) / dt;
 	float d_angle_yz = ((shortest_dist_angle_yz-control_angle) - (prev_shortest_dist_angle_yz-control_angle)) / dt;
+	*/
 
 	static float i_dist;
-	static float i_angle_xz;
-	static float i_angle_yz;
-	i_dist += (shortest_dist-control_distance) * dt;
+	static float i_x_pos;
+	i_dist += (distance_error) * dt;
 	// reset integral terms when error crosses 0
-	if( (i_dist < 0 && ((shortest_dist-control_distance) * dt > 0)) || (i_dist > 0 && ((shortest_dist-control_distance) * dt < 0)) ){
+	if( (i_dist < 0 && (distance_error * dt > 0)) || (i_dist > 0 && (distance_error * dt < 0)) ){
 		i_dist = 0;
 	}
-	i_angle_xz += (shortest_dist_angle_xz-control_angle) * dt;
-	if( (i_angle_xz < 0 && ((shortest_dist_angle_xz-control_angle)* dt > 0)) || (i_angle_xz > 0 && ((shortest_dist_angle_xz-control_angle) * dt < 0)) ){
-		i_angle_xz = 0;
-	}
-	i_angle_yz += (shortest_dist_angle_yz-control_angle) * dt;
-	if( (i_angle_yz < 0 && ((shortest_dist_angle_yz-control_angle)* dt > 0)) || (i_angle_yz > 0 && ((shortest_dist_angle_yz-control_angle) * dt < 0)) ){
-		i_angle_yz = 0;
+	i_x_pos += (x_position_error) * dt;
+	if( (i_x_pos < 0 && (x_position_error* dt > 0)) || (i_x_pos > 0 && (x_position_error * dt < 0)) ){
+		i_x_pos = 0;
 	}
 
-	if(pcl_size > 0){
-		std::cout << "Points: " << pcl_size << std::endl;
-		// create velocity control vector to steer drone towards cable
-		VelocityDroneControl(constrain(kp_angle*(shortest_dist_angle_yz-control_angle) + kd_angle*d_angle_yz + ki_angle*i_angle_yz,-0.75,0.75), 
-							constrain(kp_angle*(shortest_dist_angle_xz-control_angle) + kd_angle*d_angle_xz + ki_angle*i_angle_xz,-3,3), 
-							constrain(-kp_dist*(shortest_dist-control_distance) + (-kd_dist*d_dist) + (-ki_dist*i_dist),-1,1));
-		//VelocityDroneControl(0, kp_angle*(shortest_dist_angle_xz-control_angle), -kp_dist*(shortest_dist-control_distance));
-	} else {	
-		// control drone in square motion if nothing within lidar fov
-		static int callbackscale = 5;
-		if(callback_count < 100*callbackscale){
-			VelocityDroneControl(NAN,NAN,-3.0); // go up
-			std::cout << "START" << std::endl;
-		} else if(callback_count % (100*callbackscale) < 25*callbackscale){
-			VelocityDroneControl(0,3,0); // go east
-			std::cout << "EAST" << std::endl;
-		} else if(callback_count % (100*callbackscale) < 50*callbackscale){
-			VelocityDroneControl(3,0,0); // go north
-			std::cout << "UP" << std::endl;
-		} else if(callback_count % (100*callbackscale) < 75*callbackscale){
-			VelocityDroneControl(0,-3,0); // go west
-			std::cout << "WEST" << std::endl;
-		} else if(callback_count % (100*callbackscale) > 74*callbackscale){
-			VelocityDroneControl(-3,0,0); // go south
-			std::cout << "DOWN" << std::endl;
-		} else{
-			VelocityDroneControl(0,0,0); // do nothing
-		}	
-		callback_count++;
-	}
+	// create velocity control vector to steer drone towards cable	
+	VelocityDroneControl(
+		constrain((kp_dist*distance_error) + (ki_dist*i_dist),-1,1), // + (-kd_dist*d_dist)
+		constrain(kp_x_pos*(x_position_error) + ki_x_pos*i_x_pos,-0.75,0.75) //+ kd_x_pos*d_angle_yz
+		);
 }
+
+
+void VelocityControlVectorAdvertiser::OnOdoMsg(const px4_msgs::msg::VehicleOdometry::SharedPtr _msg){ ////
+	// Yaw angle in NED frame:
+	//
+	//			0
+	//
+	//	-pi/2	O	pi/2
+	//			
+	//		pi or -pi
+	//
+	// Get yaw from quaternion
+	yaw_ = atan2(2.0 * (_msg->q[3] * _msg->q[0] + _msg->q[1] * _msg->q[2]) , - 1.0 + 2.0 * (_msg->q[0] * _msg->q[0] + _msg->q[1] * _msg->q[1]));
+
+	// convert to degrees
+	if (yaw_ > 0){
+		yaw_deg_ = yaw_ * (180.0/PI);
+	}
+	else {
+		yaw_deg_ = 360.0 + yaw_ * (180.0/PI); // + because yaw_ is negative
+	}
+} 
 
 
 // constrains value to be between limits
@@ -205,30 +173,6 @@ float VelocityControlVectorAdvertiser::constrain(float val, float lo_lim, float 
 		return val;
 	}
 }
-
-
-// Gets drone in hovering position. Returns true when done
-bool VelocityControlVectorAdvertiser::beginHover(){
-	static auto start = std::chrono::system_clock::now();
-    auto end = std::chrono::system_clock::now();
-    std::chrono::duration<double> elapsed_seconds = end-start;
-	std::cout << "Elapsed time: " << elapsed_seconds.count() << std::endl;
-	int wait_time_s = 6;
-	if(double(elapsed_seconds.count()) > wait_time_s+3){
-		return 1;
-	}
-	else if(double(elapsed_seconds.count()) > wait_time_s){
-		VelocityDroneControl(0,0,0); // might not be a good idea
-	}
-	else if(double(elapsed_seconds.count()) > 2){
-		VelocityDroneControl( 0, 0, (elapsed_seconds.count()-wait_time_s) );
-	}
-	else{
-		VelocityDroneControl(0,0,0);
-	}
-	return 0;
-}
-
 
 	
 			
