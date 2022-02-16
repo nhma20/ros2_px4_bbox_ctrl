@@ -122,6 +122,13 @@ public:
 
 		auto timer_callback = [this]() -> void {
 
+			if (offboard_setpoint_counter_ == 1) { // 5s sleep before starting offboard
+				RCLCPP_INFO(this->get_logger(), "Waiting 5 seconds before starting offboard mode");
+				std::chrono::nanoseconds sleepperiod(5000000000); 
+				rclcpp::GenericRate<std::chrono::high_resolution_clock> rate(sleepperiod);
+				rate.sleep();  
+			}
+
 			if (offboard_setpoint_counter_ == 10) {
 				// Change to Offboard mode after 10 setpoints
 				RCLCPP_INFO(this->get_logger(), "Entering offboard control mode");
