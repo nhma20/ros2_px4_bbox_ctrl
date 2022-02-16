@@ -97,6 +97,8 @@ Fixed by renaming closest libfastrtps.so.x.y.z to libfastrtps.so.2.0.2.
 
 
 ### TODO
-0. :yellow_circle: Set up with "real" bounding box to tune PI controller
+:yellow_circle: Set up with "real" bounding box to tune PI controller
+:yellow_circle: Get working with real flight controller
+:yellow_circle: Build in more safety
 
 
